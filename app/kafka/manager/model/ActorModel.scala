@@ -8,18 +8,18 @@ package kafka.manager.model
 import java.util.Properties
 
 import grizzled.slf4j.Logging
-import kafka.common.TopicAndPartition
 import kafka.manager.jmx._
 import kafka.manager.utils
-import kafka.manager.utils.one10.MemberMetadata
+import kafka.manager.utils.two40.MemberMetadata
 import kafka.manager.utils.zero81.ForceReassignmentCommand
-import org.apache.kafka.common.requests.DescribeGroupsResponse
+import org.apache.kafka.common.TopicPartition
 import org.joda.time.DateTime
 
 import scala.collection.immutable.Queue
-import scala.concurrent.{Await, Future}
-import scala.util.{Failure, Success, Try}
+import scala.util.Try
 import scalaz.{NonEmptyList, Validation}
+
+import scala.collection.immutable.SortedMap
 import scala.collection.immutable.Map
 
 /**
@@ -52,7 +52,9 @@ object ActorModel {
   case class BVView(topicPartitions: Map[TopicIdentity, BrokerTopicInfo], clusterContext: ClusterContext,
                     metrics: Option[BrokerMetrics] = None,
                     messagesPerSecCountHistory: Option[Queue[BrokerMessagesPerSecCount]] = None,
-                    stats: Option[BrokerClusterStats] = None) extends QueryResponse {
+                    stats: Option[BrokerClusterStats] = None,
+                    broker: Option[BrokerIdentity] = None
+                   ) extends QueryResponse {
     def numTopics : Int = topicPartitions.size
     def numPartitions : Int = topicPartitions.values.foldLeft(0)((acc,i) => acc + i.partitions.size)
     def numPartitionsAsLeader : Int = topicPartitions.values.foldLeft(0)((acc,i) => acc + i.partitionsAsLeader.size)
@@ -64,11 +66,13 @@ object ActorModel {
 
   case object CMGetView extends QueryRequest
   case class CMGetTopicIdentity(topic: String) extends QueryRequest
+  case class CMGetBrokerIdentity(broker: Int) extends QueryRequest
   case object CMGetClusterContext extends QueryRequest
   case class CMView(topicsCount: Int, brokersCount: Int, clusterContext: ClusterContext) extends QueryResponse
   case class CMGetConsumerIdentity(consumer: String, consumerType: ConsumerType) extends QueryRequest
   case class CMGetConsumedTopicState(consumer: String, topic: String, consumerType: ConsumerType) extends QueryRequest
   case class CMTopicIdentity(topicIdentity: Try[TopicIdentity]) extends QueryResponse
+  case class CMBrokerIdentity(brokerIdentity: Try[BrokerIdentity]) extends QueryResponse
   case class CMConsumerIdentity(consumerIdentity: Try[ConsumerIdentity]) extends QueryResponse
   case class CMConsumedTopic(ctIdentity: Try[ConsumedTopicState]) extends QueryResponse
   case class CMGetGeneratedPartitionAssignments(topic: String) extends QueryRequest
@@ -87,8 +91,10 @@ object ActorModel {
                                            partitions: Int,
                                            readVersions: Map[String,Int]) extends CommandRequest
   case class CMUpdateTopicConfig(topic: String, config: Properties, readVersion: Int) extends CommandRequest
+  case class CMUpdateBrokerConfig(broker: Int, config: Properties, readVersion: Int) extends CommandRequest
   case class CMDeleteTopic(topic: String) extends CommandRequest
   case class CMRunPreferredLeaderElection(topics: Set[String]) extends CommandRequest
+  case class CMSchedulePreferredLeaderElection(schedule: Map[String, Int]) extends CommandRequest
   case class CMRunReassignPartition(topics: Set[String], forceSet: Set[ForceReassignmentCommand]) extends CommandRequest
   case class CMGeneratePartitionAssignments(topics: Set[String], brokers: Set[Int], replicationFactor: Option[Int] = None) extends CommandRequest
   case class CMManualPartitionAssignments(assignments: List[(String, List[(Int, List[Int])])]) extends CommandRequest
@@ -101,8 +107,8 @@ object ActorModel {
                               log_path: String,
                               config: Properties = new Properties
                               ) extends CommandRequest
-  case class CMUpdateLogkafkaConfig(logkafka_id: String, 
-                                    log_path: String, 
+  case class CMUpdateLogkafkaConfig(logkafka_id: String,
+                                    log_path: String,
                                     config: Properties,
                                     checkConfig: Boolean = true
                                     ) extends CommandRequest
@@ -127,8 +133,9 @@ object ActorModel {
                                            partitions: Int,
                                            readVersions: Map[String, Int]) extends CommandRequest
   case class KCUpdateTopicConfig(topic: String, config: Properties, readVersion: Int) extends CommandRequest
+  case class KCUpdateBrokerConfig(broker: Int, config: Properties, readVersion: Int) extends CommandRequest
   case class KCDeleteTopic(topic: String) extends CommandRequest
-  case class KCPreferredReplicaLeaderElection(topicAndPartition: Set[TopicAndPartition]) extends CommandRequest
+  case class KCPreferredReplicaLeaderElection(topicAndPartition: Set[TopicPartition]) extends CommandRequest
   case class KCReassignPartition(currentTopicIdentity: Map[String, TopicIdentity]
                                  , generatedTopicIdentity: Map[String, TopicIdentity]
                                  , forceSet: Set[ForceReassignmentCommand]) extends CommandRequest
@@ -160,6 +167,7 @@ object ActorModel {
   case object KSGetConsumers extends KSRequest
   case class KSGetTopicConfig(topic: String) extends KSRequest
   case class KSGetTopicDescription(topic: String) extends KSRequest
+  case class KSGetBrokerDescription(broker: Int) extends KSRequest
   case class KSGetAllTopicDescriptions(lastUpdateMillis: Option[Long]= None) extends KSRequest
   case class KSGetTopicDescriptions(topics: Set[String]) extends KSRequest
   case class KSGetConsumerDescription(consumer: String, consumerType: ConsumerType) extends KSRequest
@@ -169,6 +177,7 @@ object ActorModel {
   case object KSGetTopicsLastUpdateMillis extends KSRequest
   case object KSGetPreferredLeaderElection extends KSRequest
   case object KSGetReassignPartition extends KSRequest
+  case object KSGetScheduleLeaderElection extends KSRequest
   case class KSEndPreferredLeaderElection(millis: Long) extends CommandRequest
   case class KSUpdatePreferredLeaderElection(millis: Long, json: String) extends CommandRequest
   case class KSEndReassignPartition(millis: Long) extends CommandRequest
@@ -197,23 +206,30 @@ object ActorModel {
   case class ConsumerNameAndType(name: String, consumerType: ConsumerType)
   case class ConsumerList(list: IndexedSeq[ConsumerNameAndType], clusterContext: ClusterContext) extends QueryResponse
 
+  case class BrokerDescription(broker: Int,
+                               config:Option[(Int,String)]
+                              )extends  QueryResponse
   case class TopicDescription(topic: String,
                               description: (Int,String),
-                              partitionState: Option[Map[String, String]], 
+                              partitionState: Option[Map[String, String]],
                               partitionOffsets: PartitionOffsetsCapture,
                               config:Option[(Int,String)]) extends  QueryResponse
   case class TopicDescriptions(descriptions: IndexedSeq[TopicDescription], lastUpdateMillis: Long) extends QueryResponse
 
   case class BrokerList(list: IndexedSeq[BrokerIdentity], clusterContext: ClusterContext) extends QueryResponse
 
-  case class PreferredReplicaElection(startTime: DateTime, 
-                                      topicAndPartition: Set[TopicAndPartition], 
-                                      endTime: Option[DateTime], 
-                                      clusterContext: ClusterContext) extends QueryResponse
-  case class ReassignPartitions(startTime: DateTime, 
-                                partitionsToBeReassigned: Map[TopicAndPartition, Seq[Int]], 
-                                endTime: Option[DateTime], 
-                                clusterContext: ClusterContext) extends QueryResponse
+  case class PreferredReplicaElection(startTime: DateTime,
+                                      topicAndPartition: Set[TopicPartition],
+                                      endTime: Option[DateTime],
+                                      clusterContext: ClusterContext) extends QueryResponse {
+    def sortedTopicPartitionList: List[(String, Int)] = topicAndPartition.toList.map(tp => (tp.topic(), tp.partition())).sortBy(_._1)
+  }
+  case class ReassignPartitions(startTime: DateTime,
+                                partitionsToBeReassigned: Map[TopicPartition, Seq[Int]],
+                                endTime: Option[DateTime],
+                                clusterContext: ClusterContext) extends QueryResponse {
+    def sortedTopicPartitionAssignmentList : List[((String, Int), Seq[Int])] = partitionsToBeReassigned.toList.sortBy(partition => (partition._1.topic(), partition._1.partition())).map { case (tp, a) => ((tp.topic(), tp.partition()), a)}
+  }
 
   case class ConsumedTopicDescription(consumer: String,
                                       topic: String,
@@ -231,7 +247,7 @@ object ActorModel {
 
   case class GeneratedPartitionAssignments(topic: String, assignments: Map[Int, Seq[Int]], nonExistentBrokers: Set[Int])
 
-  case class BrokerIdentity(id: Int, host: String, jmxPort: Int, secure: Boolean, nonSecure:Boolean, endpoints: Map[SecurityProtocol, Int]) {
+  case class BrokerIdentity(id: Int, host: String, jmxPort: Int, secure: Boolean, nonSecure:Boolean, endpoints: Map[SecurityProtocol, Int], config: List[(String,String)]=List(),configReadVersion: Int= -1) {
     def endpointsString: String = endpoints.toList.map(tpl => s"${tpl._1.stringId}:${tpl._2}").mkString(",")
   }
 
@@ -366,7 +382,7 @@ import scala.language.reflectiveCalls
 
   object PartitionOffsetsCapture {
     val ZERO : Option[Double] = Option(0D)
-    
+
     val EMPTY : PartitionOffsetsCapture = PartitionOffsetsCapture(0, Map.empty)
 
     def getRate(part: Int, currentOffsets: PartitionOffsetsCapture, previousOffsets: PartitionOffsetsCapture): Option[Double] = {
@@ -460,6 +476,27 @@ import scala.language.reflectiveCalls
     import scala.language.reflectiveCalls
     import scala.concurrent.duration._
 
+    def parseCofig(config: Option[(Int,String)]): (Int,Map[String, String]) ={
+      import org.json4s.jackson.JsonMethods._
+      import org.json4s.scalaz.JsonScalaz._
+      import org.json4s._
+      try {
+        val resultOption: Option[(Int,Map[String, String])] = config.map { configString =>
+          val configJson = parse(configString._2)
+          val configMap : Map[String, String] = field[Map[String,String]]("config")(configJson).fold({ e =>
+            logger.error(s"Failed to parse topic config ${configString._2}")
+            Map.empty
+          }, identity)
+          (configString._1,configMap)
+        }
+        resultOption.getOrElse((-1,Map.empty[String, String]))
+      } catch {
+        case e: Exception =>
+          logger.error(s"[Failed to parse config : ${config.getOrElse("")}",e)
+          (-1,Map.empty[String, String])
+      }
+    }
+
     implicit val formats = Serialization.formats(FullTypeHints(List(classOf[TopicIdentity])))
     // Adding a write method to transform/sort the partitionsIdentity to be more readable in JSON and include Topic Identity vals
     implicit def topicIdentityJSONW: JSONW[TopicIdentity] = new JSONW[TopicIdentity] {
@@ -542,21 +579,7 @@ import scala.language.reflectiveCalls
       val partMap = getPartitionReplicaMap(td)
       val tpi : Map[Int,TopicPartitionIdentity] = getTopicPartitionIdentity(td, partMap, tdPrevious, tpSizes.getOrElse(Map.empty))
       val config : (Int,Map[String, String]) = {
-        try {
-          val resultOption: Option[(Int,Map[String, String])] = td.config.map { configString =>
-            val configJson = parse(configString._2)
-            val configMap : Map[String, String] = field[Map[String,String]]("config")(configJson).fold({ e =>
-              logger.error(s"Failed to parse topic config ${configString._2}")
-              Map.empty
-            }, identity)
-            (configString._1,configMap)
-          }
-          resultOption.getOrElse((-1,Map.empty[String, String]))
-        } catch {
-          case e: Exception =>
-            logger.error(s"[topic=${td.topic}] Failed to parse topic config : ${td.config.getOrElse("")}",e)
-            (-1,Map.empty[String, String])
-        }
+        parseCofig(td.config)
       }
       val size = tpi.flatMap(_._2.leaderSize).reduceLeftOption{ _ + _ }.map(FormatMetric.sizeFormat(_))
       TopicIdentity(td.topic,td.description._1,partMap.size,tpi,brokers,config._1,config._2.toList, clusterContext, tm, size)
@@ -651,7 +674,7 @@ import scala.language.reflectiveCalls
 
   case class ConsumerIdentity(consumerGroup:String,
                               consumerType: ConsumerType,
-                              topicMap: Map[String, ConsumedTopicState],
+                              topicMap: collection.Map[String, ConsumedTopicState],
                               clusterContext: ClusterContext)
   object ConsumerIdentity extends Logging {
     import scala.language.reflectiveCalls
@@ -664,7 +687,7 @@ import scala.language.reflectiveCalls
       } yield (topic, cts)
       ConsumerIdentity(cd.consumer,
         cd.consumerType,
-        topicMap.toMap,
+        SortedMap(topicMap: _*),
         clusterContext)
     }
 
@@ -708,7 +731,7 @@ import scala.language.reflectiveCalls
   }
 
   case class BrokerClusterStats(perMessages: BigDecimal, perIncoming: BigDecimal, perOutgoing: BigDecimal)
-  
+
   sealed trait LKVRequest extends QueryRequest
 
   case object LKVForceUpdate extends CommandRequest

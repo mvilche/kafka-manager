@@ -3,26 +3,26 @@ package controllers
 
 import java.nio.charset.StandardCharsets
 import java.security.SecureRandom
-
-import com.typesafe.config.ConfigValueType
 import java.util.UUID
-
-import com.unboundid.ldap.sdk._
-import javax.net.ssl.SSLSocketFactory
 import akka.stream.Materializer
+import com.typesafe.config.ConfigValueType
+import com.unboundid.ldap.sdk._
+import com.unboundid.ldap.sdk.extensions.StartTLSExtendedRequest
+import com.unboundid.util.ssl.{SSLUtil, TrustAllTrustManager}
+import grizzled.slf4j.Logging
+
+import javax.crypto.Mac
+import javax.net.ssl
 import org.apache.commons.codec.binary.Base64
 import play.api.Configuration
 import play.api.http.HeaderNames.{AUTHORIZATION, WWW_AUTHENTICATE}
+import play.api.libs.Codecs
 import play.api.mvc.Results.Unauthorized
 import play.api.mvc.{Cookie, Filter, RequestHeader, Result}
 
 import scala.collection.JavaConverters._
-import scala.util.{Success, Try}
-import grizzled.slf4j.Logging
-import javax.crypto.Mac
-import play.api.libs.Codecs
-
 import scala.concurrent.{ExecutionContext, Future}
+import scala.util.{Success, Try}
 
 class BasicAuthenticationFilter(configuration: BasicAuthenticationFilterConfiguration, authenticator: Authenticator)(implicit val mat: Materializer, ec: ExecutionContext) extends Filter {
 
@@ -39,11 +39,8 @@ class BasicAuthenticationFilter(configuration: BasicAuthenticationFilterConfigur
 
 trait Authenticator {
 
-  import javax.crypto.Cipher
-  import javax.crypto.SecretKeyFactory
-  import javax.crypto.spec.PBEKeySpec
-  import javax.crypto.spec.SecretKeySpec
-  import javax.crypto.spec.IvParameterSpec
+  import javax.crypto.spec.{IvParameterSpec, PBEKeySpec, SecretKeySpec}
+  import javax.crypto.{Cipher, SecretKeyFactory}
 
   private lazy val factory = SecretKeyFactory.getInstance("PBKDF2WithHmacSHA256")
   private lazy val spec = new PBEKeySpec(secret, salt, 65536, 256)
@@ -75,7 +72,7 @@ trait Authenticator {
     cipher.doFinal(content)
   }
 
-  def sign(content: String) : String = {
+  def sign(content: String): String = {
     Codecs.toHexString(mac.doFinal(content.getBytes(StandardCharsets.UTF_8)))
   }
 
@@ -147,12 +144,49 @@ case class LDAPAuthenticator(config: LDAPAuthenticationConfig)(implicit val mat:
   private lazy val unauthorizedResult = Future successful Unauthorized.withHeaders(WWW_AUTHENTICATE -> realm)
   private lazy val ldapConnectionPool: LDAPConnectionPool = {
     val (address, port) = (config.address, config.port)
-    val connection = if (config.sslEnabled) {
-      new LDAPConnection(SSLSocketFactory.getDefault, address, port, config.username, config.password)
-    } else {
-      new LDAPConnection(address, port, config.username, config.password)
+
+    if (config.sslEnabled && config.startTLSEnabled) {
+      logger.error("SSL and StartTLS enabled together. Most LDAP Server implementations will not handle this as it initializes an encrypted context over an already encrypted channel")
     }
-    new LDAPConnectionPool(connection, config.connectionPoolSize)
+
+    val connection = if (config.sslEnabled) {
+      if (config.sslTrustAll) {
+        val sslUtil = new SSLUtil(null, new TrustAllTrustManager(true))
+        val sslSocketFactory = sslUtil.createSSLSocketFactory
+        new LDAPConnection(sslSocketFactory, address, port)
+      } else {
+        val sslSocketFactory = ssl.SSLSocketFactory.getDefault
+        new LDAPConnection(sslSocketFactory, address, port)
+      }
+    } else {
+      new LDAPConnection(address, port)
+    }
+
+    var startTLSPostConnectProcessor : StartTLSPostConnectProcessor = null
+    if (config.startTLSEnabled) {
+      if (config.sslTrustAll) {
+        val sslUtil = new SSLUtil(null, new TrustAllTrustManager(true))
+        val sslContext = sslUtil.createSSLContext
+        connection.processExtendedOperation(new StartTLSExtendedRequest(sslContext))
+        startTLSPostConnectProcessor = new StartTLSPostConnectProcessor(sslContext)
+      } else {
+        val sslContext = new SSLUtil().createSSLContext
+        connection.processExtendedOperation(new StartTLSExtendedRequest(sslContext))
+        startTLSPostConnectProcessor = new StartTLSPostConnectProcessor(sslContext)
+      }
+    }
+
+    try {
+      connection.bind(config.username, config.password)
+    } catch {
+      case e: LDAPException => {
+        connection.setDisconnectInfo(DisconnectType.BIND_FAILED, null, e)
+        connection.close()
+        logger.error(s"Bind failed with ldap server ${config.address}:${config.port}", e)
+      }
+    }
+
+    new LDAPConnectionPool(connection, 1, config.connectionPoolSize, startTLSPostConnectProcessor)
   }
 
   def salt: Array[Byte] = config.salt
@@ -172,7 +206,7 @@ case class LDAPAuthenticator(config: LDAPAuthenticationConfig)(implicit val mat:
       authorization.split("\\s+").toList match {
         case "Basic" :: base64Hash :: Nil => {
           val credentials = new String(org.apache.commons.codec.binary.Base64.decodeBase64(base64Hash.getBytes))
-          credentials.split(":").toList match {
+          credentials.split(":", 2).toList match {
             case username :: password :: Nil => Some(username -> password)
             case _ => None
           }
@@ -197,7 +231,19 @@ case class LDAPAuthenticator(config: LDAPAuthenticationConfig)(implicit val mat:
               s"Base DN: ${config.searchBaseDN}. " +
               s"Filter: ${renderSearchFilter(config.searchFilter, username)}")
             false
-          case Some(userDN) => Try(connection.bind(userDN, password)).isSuccess
+          case Some(userDN) =>
+            //Check if user is in specified group
+            if (!config.groupFilter.isEmpty) {
+              val compareResult = connection.compare(new CompareRequest(userDN, "memberOf", config.groupFilter))
+              if (compareResult.compareMatched()) {
+                Try(connection.bind(userDN, password)).isSuccess
+              } else {
+                logger.debug(s"User $username is not member of Group ${config.groupFilter}")
+                false
+              }
+            } else {
+              Try(connection.bind(userDN, password)).isSuccess
+            }
         }
       } finally {
         connection.close()
@@ -257,8 +303,11 @@ case class LDAPAuthenticationConfig(salt: Array[Byte]
                                     , password: String
                                     , searchBaseDN: String
                                     , searchFilter: String
+                                    , groupFilter: String
                                     , connectionPoolSize: Int
-                                    , sslEnabled: Boolean) extends AuthenticationConfig
+                                    , sslEnabled: Boolean
+                                    , sslTrustAll: Boolean
+                                    , startTLSEnabled: Boolean) extends AuthenticationConfig
 
 sealed trait AuthType[T <: AuthenticationConfig] {
   def getConfig(config: AuthenticationConfig): T
@@ -336,15 +385,18 @@ object BasicAuthenticationFilterConfiguration {
 
       val searchDN = string("ldap.search-base-dn").getOrElse("")
       val searchFilter = string("ldap.search-filter").getOrElse("")
+      val groupFilter = string("ldap.group-filter").getOrElse("")
       val connectionPoolSize = int("ldap.connection-pool-size").getOrElse(10)
       val sslEnabled = boolean("ldap.ssl").getOrElse(false)
+      val sslTrustAll = boolean("ldap.ssl-trust-all").getOrElse(false)
+      val startTLSEnabled = boolean("ldap.starttls").getOrElse(false)
 
       BasicAuthenticationFilterConfiguration(
         enabled,
         LDAPAuth,
         LDAPAuthenticationConfig(salt, iv, secret,
           string("realm").getOrElse(defaultRealm),
-          server, port, username, password, searchDN, searchFilter, connectionPoolSize, sslEnabled
+          server, port, username, password, searchDN, searchFilter, groupFilter, connectionPoolSize, sslEnabled, sslTrustAll, startTLSEnabled
         ),
         excluded
       )
